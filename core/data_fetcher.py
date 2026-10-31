@@ -11990,183 +11990,428 @@ class DataFetcher():
 
     async def get_symbol_history_period(self, symbol: str) -> Dict[str, Any]:
         """
-        🚀 VERSION 8.0 - COMPLETE FIX: FETCH ALL AVAILABLE HISTORY
+        🚀 VERSION 8.1 — MT5 GUARD + RAW FILE SCAN FALLBACK
+
+        ─────────────────────────────────────────────────────────────────────
+        باگ‌هایی که در این نسخه رفع می‌شوند:
+        ─────────────────────────────────────────────────────────────────────
+        ۱) قبلاً این تابع مستقیماً `import MetaTrader5 as mt5` می‌زد و در
+           محیط‌های بدون MT5 (Colab / Linux) با ModuleNotFoundError کرش
+           می‌کرد. حالا قبل از هر import، `MT5_AVAILABLE` چک می‌شود.
+
+        ۲) قبلاً وقتی workflow_manager فاز ۰ نتواند تایم‌فریم را از روی
+           فایل‌های خام کشف کند (به‌دلیل case-sensitivity در glob روی
+           Linux)، این تابع fallback قطعی داشت. حالا خود این تابع
+           به‌عنوان fallback نهایی، فایل‌های خام موجود را اسکن می‌کند و
+           **هم نماد و هم تایم‌فریم** را از نام فایل استخراج می‌کند
+           (case-insensitive) و نتیجه را در `cache/tf_decisions.json`
+           ذخیره می‌کند تا اجراهای بعدی مستقیم کار کنند.
+
+        قرارداد خروجی (در حالت success):
+            {
+                "status": "success",
+                "timeframe": "30M",          # ← برای workflow_manager حیاتی است
+                "actual_symbol_used": "XAUUSDs",
+                "matched_file": "XAUUSDs_30M_fold1_raw.h5",
+                "source": "raw_file_scan_fallback",
+                ...
+            }
+
+        قرارداد خروجی (در حالت error):
+            {"status": "error", "error": "...", "timeframe": None, ...}
         """
         import traceback
         from datetime import datetime, timezone, timedelta
+        import re
         import asyncio
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ✅ CRITICAL FIX #1: Guard against MT5 not being available
+        # ═══════════════════════════════════════════════════════════════════
+        if not MT5_AVAILABLE:
+            logger.warning(
+                f"[{symbol}] ⚠️ MetaTrader5 not available — "
+                f"falling back to raw-file scan for timeframe detection"
+            )
+
+            try:
+                raw_dir = Path("data/raw/mt5")
+                if not raw_dir.exists():
+                    logger.error(f"[{symbol}] ❌ raw data directory not found: {raw_dir}")
+                    return {
+                        "status": "error",
+                        "error": "MetaTrader5 not installed and raw data directory not found",
+                        "symbol": symbol,
+                        "timeframe": None,
+                        "data_points": 0,
+                        "source": "no_mt5_no_raw_dir",
+                        "phase_log": ["[MT5_GUARD] No MT5 and no raw data dir"],
+                    }
+
+                # ساخت مجموعه‌ای از واریانت‌های نام نماد (case-insensitive)
+                clean_symbol_upper = str(symbol).replace(".", "").upper()
+                symbol_variants = {
+                    str(symbol),
+                    str(symbol).upper(),
+                    str(symbol).lower(),
+                    clean_symbol_upper,
+                    clean_symbol_upper.lower(),
+                }
+
+                detected_tf: Optional[str] = None
+                detected_symbol: Optional[str] = None
+                matched_file: Optional[str] = None
+
+                valid_tfs = {
+                    "1M", "5M", "15M", "30M",
+                    "1H", "2H", "4H", "6H", "8H", "12H",
+                    "1D", "1W", "1MN",
+                }
+
+                # الگوی regex برای نام فایل: <SYMBOL>_<TF>_fold<N>_raw.h5
+                # از .+? برای symbol استفاده می‌کنیم تا نمادهای دارای _ پشتیبانی شوند.
+                fname_pattern = re.compile(
+                    r"^(?P<sym>.+?)_"
+                    r"(?P<tf>\d+[MHDWMN]?|1M|5M|15M|30M|1H|2H|4H|6H|8H|12H|1D|1W|1MN)"
+                    r"_fold\d+_raw\.h5$",
+                    re.IGNORECASE,
+                )
+
+                raw_files = sorted(raw_dir.glob("*_*_fold*_raw.h5"))
+                logger.info(
+                    f"[{symbol}] 🔍 Scanning {len(raw_files)} raw file(s) "
+                    f"for symbol match (variants={sorted(symbol_variants)})"
+                )
+
+                for f in raw_files:
+                    m = fname_pattern.match(f.name)
+                    if not m:
+                        continue
+
+                    file_symbol = m.group("sym")
+                    file_tf = m.group("tf").upper()
+
+                    symbol_match = file_symbol.upper() in {
+                        v.upper() for v in symbol_variants
+                    }
+                    tf_valid = (
+                        file_tf in valid_tfs
+                        or re.match(r"^\d+[MHDWMN]?$", file_tf) is not None
+                    )
+
+                    if symbol_match and tf_valid:
+                        detected_tf = file_tf
+                        detected_symbol = file_symbol
+                        matched_file = f.name
+                        break
+
+                # ─── حالت موفق: فایل خام برای این نماد پیدا شد ───
+                if detected_tf and matched_file:
+                    logger.info(
+                        f"[{symbol}] ✅ Detected from raw files: "
+                        f"symbol='{detected_symbol}', timeframe='{detected_tf}', "
+                        f"file='{matched_file}'"
+                    )
+
+                    # ذخیره‌ی تصمیم برای اجراهای بعدی (best-effort، هرگز کرش نمی‌کند)
+                    try:
+                        await self._save_tf_decision_once(detected_symbol, detected_tf)
+                        logger.info(
+                            f"[{symbol}] 💾 TF decision persisted: "
+                            f"{detected_symbol} → {detected_tf}"
+                        )
+                    except Exception as save_err:
+                        logger.warning(
+                            f"[{symbol}] ⚠️ Could not save TF decision "
+                            f"(non-fatal): {save_err}"
+                        )
+
+                    return {
+                        "status": "success",
+                        "symbol": symbol,
+                        "actual_symbol_used": detected_symbol,
+                        "timeframe": detected_tf,
+                        "data_points": 0,   # از نام فایل قابل شمارش نیست
+                        "actual_start": None,
+                        "end_date": None,
+                        "matched_file": matched_file,
+                        "source": "raw_file_scan_fallback",
+                        "phase_log": [
+                            "[MT5_GUARD] MetaTrader5 not available",
+                            f"[RAW_SCAN] Found '{matched_file}' → "
+                            f"symbol='{detected_symbol}', tf='{detected_tf}'",
+                        ],
+                    }
+
+                # ─── حالت خطا: هیچ فایلی برای این نماد پیدا نشد ───
+                logger.error(
+                    f"[{symbol}] ❌ No matching raw file found for "
+                    f"symbol variants: {sorted(symbol_variants)}. "
+                    f"Scanned {len(raw_files)} file(s) in {raw_dir}"
+                )
+                return {
+                    "status": "error",
+                    "error": (
+                        f"MetaTrader5 not installed and no matching raw "
+                        f"files found for symbol '{symbol}'"
+                    ),
+                    "symbol": symbol,
+                    "timeframe": None,
+                    "data_points": 0,
+                    "scanned_files": len(raw_files),
+                    "source": "no_mt5_no_match",
+                    "phase_log": ["[MT5_GUARD] No matching raw files"],
+                }
+
+            except Exception as fallback_err:
+                logger.error(
+                    f"[{symbol}] ❌ Fallback raw-scan failed: {fallback_err}",
+                    exc_info=True,
+                )
+                return {
+                    "status": "error",
+                    "error": f"MT5 not available and fallback failed: {fallback_err}",
+                    "symbol": symbol,
+                    "timeframe": None,
+                    "data_points": 0,
+                    "source": "fallback_error",
+                    "phase_log": [f"[MT5_GUARD] Fallback error: {fallback_err}"],
+                }
+
+        # ═══════════════════════════════════════════════════════════════════
+        # از اینجا به بعد: مسیر اصلی MT5 — بدون هیچ تغییری نسبت به قبل
+        # ═══════════════════════════════════════════════════════════════════
         import MetaTrader5 as mt5
-        
+
         LOCAL_TF_MAP = {
             "1MN": mt5.TIMEFRAME_MN1,
-            "1W": mt5.TIMEFRAME_W1,
-            "1D": mt5.TIMEFRAME_D1,
+            "1W":  mt5.TIMEFRAME_W1,
+            "1D":  mt5.TIMEFRAME_D1,
             "12H": mt5.TIMEFRAME_H12,
-            "8H": mt5.TIMEFRAME_H8,
-            "6H": mt5.TIMEFRAME_H6,
-            "4H": mt5.TIMEFRAME_H4,
-            "2H": None,
-            "1H": mt5.TIMEFRAME_H1,
+            "8H":  mt5.TIMEFRAME_H8,
+            "6H":  mt5.TIMEFRAME_H6,
+            "4H":  mt5.TIMEFRAME_H4,
+            "2H":  None,
+            "1H":  mt5.TIMEFRAME_H1,
             "30M": mt5.TIMEFRAME_M30,
             "15M": mt5.TIMEFRAME_M15,
-            "5M": mt5.TIMEFRAME_M5,
-            "1M": mt5.TIMEFRAME_M1
+            "5M":  mt5.TIMEFRAME_M5,
+            "1M":  mt5.TIMEFRAME_M1,
         }
-        
-        TIMEFRAMES_ORDER = ["1MN", "1W", "1D", "12H", "8H", "6H", "4H", "2H", "1H", "30M", "15M", "5M", "1M"]
-        MIN_REQUIRED_ROWS = 100000  # 100,000 ردیف حداقل مورد نیاز
-        
-        phase_log = []
-        
-        def log_phase(phase_name: str, status: str, details: str = "", error: Exception = None):
-            timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+        TIMEFRAMES_ORDER = [
+            "1MN", "1W", "1D", "12H", "8H", "6H",
+            "4H", "2H", "1H", "30M", "15M", "5M", "1M",
+        ]
+        MIN_REQUIRED_ROWS = 100_000  # 100,000 ردیف حداقل
+
+        phase_log: List[str] = []
+
+        def log_phase(phase_name: str, status: str,
+                      details: str = "", error: Exception = None):
+            timestamp = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S.%f"
+            )[:-3]
             if error:
-                log_entry = f"[{timestamp}] [{phase_name}] {status} | {details} | ERROR: {str(error)}"
-                logger.error(log_entry)
+                entry = (
+                    f"[{timestamp}] [{phase_name}] {status} | "
+                    f"{details} | ERROR: {str(error)}"
+                )
+                logger.error(entry)
             else:
-                log_entry = f"[{timestamp}] [{phase_name}] {status} | {details}"
-                logger.info(log_entry)
-            phase_log.append(log_entry)
-        
-        log_phase("START", "INFO", f"Symbol={symbol}, MIN_REQUIRED_ROWS={MIN_REQUIRED_ROWS:,}")
-        
-        # =====================================================================
-        # PHASE 1: Input validation
-        # =====================================================================
+                entry = f"[{timestamp}] [{phase_name}] {status} | {details}"
+                logger.info(entry)
+            phase_log.append(entry)
+
+        log_phase(
+            "START", "INFO",
+            f"Symbol={symbol}, MIN_REQUIRED_ROWS={MIN_REQUIRED_ROWS:,}",
+        )
+
+        # ═════════ PHASE 1: Input validation ═════════
         try:
             log_phase("PHASE1_VALIDATION", "STARTED", "")
-            
             if not symbol or not isinstance(symbol, str):
                 error_msg = f"Invalid symbol: {symbol}"
                 log_phase("PHASE1_VALIDATION", "FAILED", error_msg)
-                return {"status": "error", "error": error_msg, "timeframe": None, "data_points": 0, "phase_log": phase_log}
-            
+                return {
+                    "status": "error", "error": error_msg,
+                    "timeframe": None, "data_points": 0,
+                    "phase_log": phase_log,
+                }
             original_symbol = symbol
-            symbol = symbol.upper().replace('.', '')
-            log_phase("PHASE1_VALIDATION", "SUCCESS", f"Normalized symbol: {symbol}")
-            
+            symbol = symbol.upper().replace(".", "")
+            log_phase(
+                "PHASE1_VALIDATION", "SUCCESS",
+                f"Normalized symbol: {symbol}",
+            )
         except Exception as e:
             log_phase("PHASE1_VALIDATION", "EXCEPTION", "", e)
-            return {"status": "error", "error": f"Phase1 validation failed: {str(e)}", "timeframe": None, "data_points": 0, "phase_log": phase_log}
+            return {
+                "status": "error",
+                "error": f"Phase1 validation failed: {str(e)}",
+                "timeframe": None, "data_points": 0,
+                "phase_log": phase_log,
+            }
 
-        # =====================================================================
-        # PHASE 2: Ensure MT5 connection
-        # =====================================================================
+        # ═════════ PHASE 2: Ensure MT5 connection ═════════
         try:
             log_phase("PHASE2_MT5_CONNECTION", "STARTED", "")
-            
+
             creds = await self._load_mt5_credentials()
             mt5_connected = False
-            
+
             if creds:
-                creds_login = creds.get('login')
-                creds_password = creds.get('password')
-                creds_server = creds.get('server')
-                
+                creds_login = creds.get("login")
+                creds_password = creds.get("password")
+                creds_server = creds.get("server")
+
                 if creds_login and creds_password and creds_server:
-                    log_phase("PHASE2_MT5_CONNECTION", "INFO", f"Loading credentials: login={creds_login}")
-                    
+                    log_phase(
+                        "PHASE2_MT5_CONNECTION", "INFO",
+                        f"Loading credentials: login={creds_login}",
+                    )
                     try:
                         terminal_info = mt5.terminal_info()
                         if terminal_info is not None:
                             account_info = mt5.account_info()
-                            if account_info is not None and str(account_info.login) == str(creds_login):
-                                log_phase("PHASE2_MT5_CONNECTION", "SUCCESS", f"Already connected! Account: {account_info.login}")
+                            if (account_info is not None
+                                    and str(account_info.login) == str(creds_login)):
+                                log_phase(
+                                    "PHASE2_MT5_CONNECTION", "SUCCESS",
+                                    f"Already connected! Account: {account_info.login}",
+                                )
                                 mt5_connected = True
-                        
+
                         if not mt5_connected:
                             mt5.shutdown()
                             await asyncio.sleep(0.5)
-                            
                             if mt5.initialize():
-                                if mt5.login(int(creds_login), password=creds_password, server=creds_server):
+                                if mt5.login(
+                                    int(creds_login),
+                                    password=creds_password,
+                                    server=creds_server,
+                                ):
                                     account_info = mt5.account_info()
                                     if account_info:
-                                        log_phase("PHASE2_MT5_CONNECTION", "SUCCESS", f"Connected! Account: {account_info.login}")
+                                        log_phase(
+                                            "PHASE2_MT5_CONNECTION", "SUCCESS",
+                                            f"Connected! Account: {account_info.login}",
+                                        )
                                         mt5_connected = True
                     except Exception as e:
-                        log_phase("PHASE2_MT5_CONNECTION", "WARNING", f"Connection error: {e}")
+                        log_phase(
+                            "PHASE2_MT5_CONNECTION", "WARNING",
+                            f"Connection error: {e}",
+                        )
 
             if not mt5_connected:
                 error_msg = "Could not establish MT5 connection"
                 log_phase("PHASE2_MT5_CONNECTION", "FAILED", error_msg)
-                return {"status": "error", "error": error_msg, "timeframe": None, "data_points": 0, "phase_log": phase_log}
-            
+                return {
+                    "status": "error", "error": error_msg,
+                    "timeframe": None, "data_points": 0,
+                    "phase_log": phase_log,
+                }
+
         except Exception as e:
             log_phase("PHASE2_MT5_CONNECTION", "EXCEPTION", "", e)
-            return {"status": "error", "error": f"MT5 connection failed: {str(e)}", "timeframe": None, "data_points": 0, "phase_log": phase_log}
+            return {
+                "status": "error",
+                "error": f"MT5 connection failed: {str(e)}",
+                "timeframe": None, "data_points": 0,
+                "phase_log": phase_log,
+            }
 
-        # =====================================================================
-        # PHASE 3: Find actual symbol in broker
-        # =====================================================================
+        # ═════════ PHASE 3: Find actual symbol in broker ═════════
         try:
             log_phase("PHASE3_FIND_SYMBOL", "STARTED", "")
-            
             actual_symbol, server_name = await self._find_best_symbol_match(symbol)
-            
             if actual_symbol is None:
-                error_msg = f"Could not find symbol '{symbol}' in broker's symbol list"
+                error_msg = (
+                    f"Could not find symbol '{symbol}' in broker's symbol list"
+                )
                 log_phase("PHASE3_FIND_SYMBOL", "FAILED", error_msg)
-                return {"status": "error", "error": error_msg, "timeframe": None, "data_points": 0, "phase_log": phase_log}
-            
-            log_phase("PHASE3_FIND_SYMBOL", "SUCCESS", f"Found actual symbol: '{actual_symbol}'")
+                return {
+                    "status": "error", "error": error_msg,
+                    "timeframe": None, "data_points": 0,
+                    "phase_log": phase_log,
+                }
+            log_phase(
+                "PHASE3_FIND_SYMBOL", "SUCCESS",
+                f"Found actual symbol: '{actual_symbol}'",
+            )
             self._actual_symbol = actual_symbol
-            
         except Exception as e:
             log_phase("PHASE3_FIND_SYMBOL", "EXCEPTION", "", e)
-            return {"status": "error", "error": f"Symbol search failed: {str(e)}", "timeframe": None, "data_points": 0, "phase_log": phase_log}
-        
-        # =====================================================================
-        # PHASE 4: Select and enable symbol
-        # =====================================================================
+            return {
+                "status": "error",
+                "error": f"Symbol search failed: {str(e)}",
+                "timeframe": None, "data_points": 0,
+                "phase_log": phase_log,
+            }
+
+        # ═════════ PHASE 4: Select and enable symbol ═════════
         try:
             log_phase("PHASE4_SELECT_SYMBOL", "STARTED", "")
             mt5.symbol_select(actual_symbol, True)
-            log_phase("PHASE4_SELECT_SYMBOL", "SUCCESS", f"Symbol {actual_symbol} selected")
+            log_phase(
+                "PHASE4_SELECT_SYMBOL", "SUCCESS",
+                f"Symbol {actual_symbol} selected",
+            )
         except Exception as e:
-            log_phase("PHASE4_SELECT_SYMBOL", "WARNING", f"Error selecting symbol: {e}")
-        
-        # =====================================================================
-        # PHASE 5: Check each timeframe - GET ALL AVAILABLE HISTORY
-        # =====================================================================
-        timeframe_details = {}
-        selected_tf = None
+            log_phase(
+                "PHASE4_SELECT_SYMBOL", "WARNING",
+                f"Error selecting symbol: {e}",
+            )
+
+        # ═════════ PHASE 5: Check each timeframe ═════════
+        timeframe_details: Dict[str, Any] = {}
+        selected_tf: Optional[str] = None
         selected_rates = None
-        best_tf = None
+        best_tf: Optional[str] = None
         best_rows = 0
         best_rates = None
-        
+
         for tf in TIMEFRAMES_ORDER:
             try:
-                log_phase("PHASE5_CHECK_TF", "STARTED", f"Checking timeframe: {tf}")
-                
+                log_phase(
+                    "PHASE5_CHECK_TF", "STARTED",
+                    f"Checking timeframe: {tf}",
+                )
                 tf_code = LOCAL_TF_MAP.get(tf)
                 if tf == "2H" and tf_code is None:
                     tf_code = LOCAL_TF_MAP.get("1H")
                 if tf_code is None:
-                    log_phase("PHASE5_CHECK_TF", "SKIPPED", f"TF {tf} not supported")
+                    log_phase(
+                        "PHASE5_CHECK_TF", "SKIPPED",
+                        f"TF {tf} not supported",
+                    )
                     continue
-                
-                # دریافت کل تاریخچه موجود برای این تایم‌فریم
-                rates, first_date, last_date, row_count = await self._fetch_all_history_for_timeframe(
-                    symbol=actual_symbol,
-                    timeframe=tf,
-                    tf_code=tf_code
+
+                rates, first_date, last_date, row_count = (
+                    await self._fetch_all_history_for_timeframe(
+                        symbol=actual_symbol,
+                        timeframe=tf,
+                        tf_code=tf_code,
+                    )
                 )
-                
+
                 if rates is None or row_count == 0:
                     timeframe_details[tf] = {
-                        "rows": 0, 
-                        "status": "no_data",
-                        "available_from": None,
-                        "available_to": None
+                        "rows": 0, "status": "no_data",
+                        "available_from": None, "available_to": None,
                     }
                     continue
-                
-                # ثبت جزئیات
-                data_age_days = (last_date - first_date).days if first_date and last_date else 0
-                data_age_years = data_age_days / 365.25 if data_age_days > 0 else 0
-                
+
+                data_age_days = (
+                    (last_date - first_date).days
+                    if first_date and last_date else 0
+                )
+                data_age_years = (
+                    data_age_days / 365.25 if data_age_days > 0 else 0
+                )
+
                 timeframe_details[tf] = {
                     "rows": row_count,
                     "first_time": first_date.isoformat() if first_date else None,
@@ -12174,61 +12419,89 @@ class DataFetcher():
                     "method": "full_history_fetch",
                     "status": "checked",
                     "data_age_days": data_age_days,
-                    "data_age_years": data_age_years
+                    "data_age_years": data_age_years,
                 }
-                
-                # Track best (highest rows)
+
                 if row_count > best_rows:
                     best_rows = row_count
                     best_tf = tf
                     best_rates = rates
-                
-                # فقط انتخاب اگر >= 100,000 ردیف
+
                 if row_count >= MIN_REQUIRED_ROWS:
                     percentage = (row_count / MIN_REQUIRED_ROWS * 100)
-                    log_phase("PHASE5_CHECK_TF", "SELECTED", 
-                             f"✅✅✅ TF={tf} SELECTED with {row_count:,} candles ({percentage:.1f}% of {MIN_REQUIRED_ROWS:,})")
-                    log_phase("PHASE5_CHECK_TF", "SELECTED", 
-                             f"    From: {first_date.date()} to {last_date.date()} ({data_age_years:.1f} years)")
+                    log_phase(
+                        "PHASE5_CHECK_TF", "SELECTED",
+                        f"✅✅✅ TF={tf} SELECTED with {row_count:,} candles "
+                        f"({percentage:.1f}% of {MIN_REQUIRED_ROWS:,})",
+                    )
+                    log_phase(
+                        "PHASE5_CHECK_TF", "SELECTED",
+                        f"    From: {first_date.date()} to {last_date.date()} "
+                        f"({data_age_years:.1f} years)",
+                    )
                     selected_tf = tf
                     selected_rates = rates
                     break
                 else:
                     percentage = (row_count / MIN_REQUIRED_ROWS * 100)
-                    log_phase("PHASE5_CHECK_TF", "INSUFFICIENT", 
-                             f"TF={tf} has {row_count:,} candles ({percentage:.1f}% of {MIN_REQUIRED_ROWS:,}) - NOT SELECTED")
-                
+                    log_phase(
+                        "PHASE5_CHECK_TF", "INSUFFICIENT",
+                        f"TF={tf} has {row_count:,} candles "
+                        f"({percentage:.1f}% of {MIN_REQUIRED_ROWS:,}) "
+                        f"- NOT SELECTED",
+                    )
+
             except Exception as e:
                 log_phase("PHASE5_CHECK_TF", "EXCEPTION", f"TF={tf}", e)
-                timeframe_details[tf] = {"rows": 0, "status": "error", "error": str(e)}
+                timeframe_details[tf] = {
+                    "rows": 0, "status": "error", "error": str(e),
+                }
                 continue
-        
-        # =====================================================================
-        # PHASE 6: Return result
-        # =====================================================================
+
+        # ═════════ PHASE 6: Return result ═════════
         try:
             log_phase("PHASE6_SELECTION", "STARTED", "")
-            
-            if selected_tf and selected_rates is not None and len(selected_rates) >= MIN_REQUIRED_ROWS:
+
+            if (selected_tf and selected_rates is not None
+                    and len(selected_rates) >= MIN_REQUIRED_ROWS):
                 first_bar_ts = selected_rates[0]["time"]
                 last_bar_ts = selected_rates[-1]["time"]
-                first_bar_time = datetime.fromtimestamp(first_bar_ts, tz=timezone.utc)
-                last_bar_time = datetime.fromtimestamp(last_bar_ts, tz=timezone.utc)
-                
+                first_bar_time = datetime.fromtimestamp(
+                    first_bar_ts, tz=timezone.utc,
+                )
+                last_bar_time = datetime.fromtimestamp(
+                    last_bar_ts, tz=timezone.utc,
+                )
+
                 data_age_days = (last_bar_time - first_bar_time).days
                 data_age_years = data_age_days / 365.25
-                
-                log_phase("PHASE6_SELECTION", "SUCCESS", f"✅ FINAL SELECTION: {selected_tf}")
-                log_phase("PHASE6_SELECTION", "SUCCESS", f"   Rows: {len(selected_rates):,}")
-                log_phase("PHASE6_SELECTION", "SUCCESS", f"   Period: {first_bar_time.date()} to {last_bar_time.date()}")
-                log_phase("PHASE6_SELECTION", "SUCCESS", f"   Age: {data_age_years:.1f} years ({data_age_days:,} days)")
-                
-                # Save decision for future use
+
+                log_phase(
+                    "PHASE6_SELECTION", "SUCCESS",
+                    f"✅ FINAL SELECTION: {selected_tf}",
+                )
+                log_phase(
+                    "PHASE6_SELECTION", "SUCCESS",
+                    f"   Rows: {len(selected_rates):,}",
+                )
+                log_phase(
+                    "PHASE6_SELECTION", "SUCCESS",
+                    f"   Period: {first_bar_time.date()} to {last_bar_time.date()}",
+                )
+                log_phase(
+                    "PHASE6_SELECTION", "SUCCESS",
+                    f"   Age: {data_age_years:.1f} years "
+                    f"({data_age_days:,} days)",
+                )
+
                 try:
                     await self._save_tf_decision_once(symbol, selected_tf)
                 except Exception as save_err:
-                    log_phase("PHASE6_SELECTION", "WARNING", f"Could not save TF decision: {save_err}")
-                
+                    log_phase(
+                        "PHASE6_SELECTION", "WARNING",
+                        f"Could not save TF decision: {save_err}",
+                    )
+
                 return {
                     "status": "success",
                     "symbol": symbol,
@@ -12241,10 +12514,11 @@ class DataFetcher():
                     "data_age_days": data_age_days,
                     "data_age_years": data_age_years,
                     "all_timeframes_details": timeframe_details,
-                    "phase_log": phase_log
+                    "phase_log": phase_log,
+                    "source": "mt5_live",
                 }
-            
-            # No timeframe with sufficient data
+
+            # هیچ TF با دادهٔ کافی پیدا نشد
             best_age_years = 0
             if best_rates is not None and len(best_rates) > 0:
                 first_ts = best_rates[0]["time"]
@@ -12252,26 +12526,31 @@ class DataFetcher():
                 first_time = datetime.fromtimestamp(first_ts, tz=timezone.utc)
                 last_time = datetime.fromtimestamp(last_ts, tz=timezone.utc)
                 best_age_years = (last_time - first_time).days / 365.25
-            
+
             error_msg = (
                 f"No timeframe has sufficient data for symbol {symbol}. "
                 f"Minimum required: {MIN_REQUIRED_ROWS:,} candles. "
-                f"Best found: {best_tf} with {best_rows:,} candles ({best_rows/MIN_REQUIRED_ROWS*100:.1f}% of required). "
+                f"Best found: {best_tf} with {best_rows:,} candles "
+                f"({best_rows / MIN_REQUIRED_ROWS * 100:.1f}% of required). "
                 f"Best data age: {best_age_years:.1f} years"
             )
-            
             log_phase("PHASE6_SELECTION", "FAILED", error_msg)
-            
-            # Log all timeframes summary
+
             log_phase("PHASE6_SELECTION", "SUMMARY", "All timeframes:")
             for tf, details in timeframe_details.items():
                 rows = details.get("rows", 0)
                 status = details.get("status", "unknown")
                 age = details.get("data_age_years", 0)
-                percentage = (rows / MIN_REQUIRED_ROWS * 100) if rows > 0 else 0
-                log_phase("PHASE6_SELECTION", "SUMMARY", 
-                         f"  {tf:>4}: {rows:>8,} rows ({percentage:>5.1f}%) | age: {age:.1f}y | status: {status}")
-            
+                percentage = (
+                    (rows / MIN_REQUIRED_ROWS * 100) if rows > 0 else 0
+                )
+                log_phase(
+                    "PHASE6_SELECTION", "SUMMARY",
+                    f"  {tf:>4}: {rows:>8,} rows "
+                    f"({percentage:>5.1f}%) | age: {age:.1f}y | "
+                    f"status: {status}",
+                )
+
             return {
                 "status": "error",
                 "error": error_msg,
@@ -12283,11 +12562,14 @@ class DataFetcher():
                 "best_timeframe_found": best_tf,
                 "best_data_points": best_rows,
                 "best_data_age_years": best_age_years,
-                "completion_percentage": (best_rows / MIN_REQUIRED_ROWS * 100) if best_rows > 0 else 0,
+                "completion_percentage": (
+                    (best_rows / MIN_REQUIRED_ROWS * 100)
+                    if best_rows > 0 else 0
+                ),
                 "all_timeframes_details": timeframe_details,
-                "phase_log": phase_log
+                "phase_log": phase_log,
             }
-            
+
         except Exception as e:
             log_phase("PHASE6_SELECTION", "EXCEPTION", "", e)
             return {
@@ -12296,7 +12578,7 @@ class DataFetcher():
                 "timeframe": None,
                 "data_points": 0,
                 "min_required_rows": MIN_REQUIRED_ROWS,
-                "phase_log": phase_log
+                "phase_log": phase_log,
             }
             
     async def _fetch_single_tf(
